@@ -1,8 +1,15 @@
+# Core ML dependencies
 torch>=1.10.0
 torchvision>=0.11.0
+tensorflow>=2.10.0
 numpy>=1.21.0
 matplotlib>=3.4.0
 scipy>=1.7.0
 pillow>=8.3.0
 tqdm>=4.62.0
+
+# Notebook support
 jupyter>=1.0.0
+
+# Investor Demo App
+streamlit>=1.28.0
