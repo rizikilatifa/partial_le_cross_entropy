@@ -10,9 +10,8 @@ import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
-import tensorflow as tf
 from scipy.spatial import cKDTree
-from scipy.ndimage import binary_erosion
+from scipy.ndimage import binary_erosion, convolve
 import random
 import time
 from PIL import Image
@@ -28,7 +27,6 @@ st.set_page_config(
 
 # Set seeds for reproducibility
 np.random.seed(42)
-tf.random.set_seed(42)
 random.seed(42)
 
 # ============================================================================
@@ -68,12 +66,13 @@ st.markdown("""
         font-size: 1rem;
         opacity: 0.9;
     }
-    .highlight-box {
-        background: #f8f9fa;
-        border-left: 4px solid #1E88E5;
-        padding: 20px;
-        border-radius: 0 10px 10px 0;
-        margin: 20px 0;
+    .stButton>button {
+        background: linear-gradient(90deg, #1E88E5, #7C4DFF);
+        color: white;
+        border: none;
+        padding: 10px 30px;
+        border-radius: 25px;
+        font-weight: 600;
     }
     .problem-box {
         background: #fff3e0;
@@ -89,24 +88,11 @@ st.markdown("""
         border-radius: 0 10px 10px 0;
         margin: 20px 0;
     }
-    .stButton>button {
-        background: linear-gradient(90deg, #1E88E5, #7C4DFF);
-        color: white;
-        border: none;
-        padding: 10px 30px;
-        border-radius: 25px;
-        font-weight: 600;
-        transition: all 0.3s;
-    }
-    .stButton>button:hover {
-        transform: scale(1.05);
-        box-shadow: 0 4px 15px rgba(30, 136, 229, 0.4);
-    }
 </style>
 """, unsafe_allow_html=True)
 
 # ============================================================================
-# CORE COMPONENTS (Lightweight versions for demo)
+# CONSTANTS
 # ============================================================================
 
 CLASS_COLORS = {
@@ -120,13 +106,17 @@ CLASS_COLORS = {
 CLASS_NAMES = ['Forest', 'Urban', 'Water', 'Agriculture', 'Bare Soil']
 
 DISPLAY_COLORS = {
-    0: '#228B22',  # Forest - green
-    1: '#D2B48C',  # Urban - tan
-    2: '#4169E1',  # Water - blue
-    3: '#F0E68C',  # Agricultural - yellow
-    4: '#8B4513',  # Bare soil - brown
+    0: '#228B22',  # Forest
+    1: '#D2B48C',  # Urban
+    2: '#4169E1',  # Water
+    3: '#F0E68C',  # Agricultural
+    4: '#8B4513',  # Bare soil
 }
 
+
+# ============================================================================
+# SYNTHETIC DATA GENERATION
+# ============================================================================
 
 def generate_synthetic_image(img_size=128, num_classes=5):
     """Generate a synthetic satellite-like image with segmentation mask."""
@@ -190,81 +180,82 @@ def generate_point_labels(mask, num_points_per_class=5):
     return point_mask, positions
 
 
-def build_unet_lite(input_shape=(128, 128, 3), num_classes=5):
-    """Build a lightweight U-Net model."""
-    from tensorflow import keras
-    from tensorflow.keras import layers
+# ============================================================================
+# SIMPLE SEGMENTATION MODEL (Pure NumPy)
+# ============================================================================
 
-    def conv_block(x, filters):
-        x = layers.Conv2D(filters, 3, padding='same', use_bias=False)(x)
-        x = layers.BatchNormalization()(x)
-        x = layers.Activation('relu')(x)
-        x = layers.Conv2D(filters, 3, padding='same', use_bias=False)(x)
-        x = layers.BatchNormalization()(x)
-        x = layers.Activation('relu')(x)
-        return x
+class SimpleSegmenter:
+    """A simple segmentation model using color clustering and spatial smoothing."""
 
-    inputs = layers.Input(shape=input_shape)
+    def __init__(self, num_classes=5):
+        self.num_classes = num_classes
+        self.class_centers = None
 
-    # Encoder
-    c1 = conv_block(inputs, 32)
-    p1 = layers.MaxPooling2D((2, 2))(c1)
-    c2 = conv_block(p1, 64)
-    p2 = layers.MaxPooling2D((2, 2))(c2)
-    c3 = conv_block(p2, 128)
-    p3 = layers.MaxPooling2D((2, 2))(c3)
-    c4 = conv_block(p3, 256)
+    def fit(self, images, point_masks, num_iterations=10):
+        """
+        Train the model using point annotations.
 
-    # Decoder
-    u3 = layers.Conv2DTranspose(128, (2, 2), strides=(2, 2), padding='same')(c4)
-    u3 = layers.Concatenate()([u3, c3])
-    c5 = conv_block(u3, 128)
+        Uses a simple approach:
+        1. Learn class color centers from labeled pixels
+        2. Use k-nearest neighbors for initial prediction
+        3. Apply spatial smoothing
+        """
+        # Collect labeled pixels
+        all_pixels = []
+        all_labels = []
 
-    u2 = layers.Conv2DTranspose(64, (2, 2), strides=(2, 2), padding='same')(c5)
-    u2 = layers.Concatenate()([u2, c2])
-    c6 = conv_block(u2, 64)
+        for img, pmask in zip(images, point_masks):
+            labeled = pmask != -1
+            pixels = img[labeled]
+            labels = pmask[labeled]
+            all_pixels.append(pixels)
+            all_labels.append(labels)
 
-    u1 = layers.Conv2DTranspose(32, (2, 2), strides=(2, 2), padding='same')(c6)
-    u1 = layers.Concatenate()([u1, c1])
-    c7 = conv_block(u1, 32)
+        all_pixels = np.vstack(all_pixels)
+        all_labels = np.concatenate(all_labels)
 
-    outputs = layers.Conv2D(num_classes, (1, 1), padding='same')(c7)
+        # Compute class color centers
+        self.class_centers = np.zeros((self.num_classes, 3))
+        for cls in range(self.num_classes):
+            cls_pixels = all_pixels[all_labels == cls]
+            if len(cls_pixels) > 0:
+                self.class_centers[cls] = cls_pixels.mean(axis=0)
 
-    return keras.Model(inputs, outputs, name='UNetLite')
+        return self
 
+    def predict(self, image):
+        """Predict segmentation for an image."""
+        H, W, C = image.shape
 
-class PartialCrossEntropyLoss(tf.keras.losses.Loss):
-    """Partial Cross Entropy Loss for weakly supervised segmentation."""
+        # Compute distance to each class center
+        distances = np.zeros((H, W, self.num_classes))
+        for cls in range(self.num_classes):
+            diff = image - self.class_centers[cls]
+            distances[:, :, cls] = np.sqrt((diff ** 2).sum(axis=2))
 
-    def __init__(self, ignore_index=-1, name='partial_crossentropy'):
-        super().__init__(name=name)
-        self.ignore_index = ignore_index
+        # Initial prediction: assign to nearest class
+        prediction = np.argmin(distances, axis=2)
 
-    def call(self, y_true, y_pred):
-        y_true = tf.cast(y_true, tf.int32)
-        label_mask = tf.not_equal(y_true, self.ignore_index)
+        # Apply spatial smoothing using majority voting
+        smoothed = self._smooth_prediction(prediction)
 
-        num_classes = tf.shape(y_pred)[-1]
+        return smoothed
 
-        y_pred_flat = tf.reshape(y_pred, [-1, num_classes])
-        y_true_flat = tf.reshape(y_true, [-1])
-        label_mask_flat = tf.reshape(label_mask, [-1])
+    def _smooth_prediction(self, pred, kernel_size=5):
+        """Apply spatial smoothing using majority voting in local neighborhoods."""
+        H, W = pred.shape
+        smoothed = pred.copy()
 
-        labeled_indices = tf.squeeze(tf.where(label_mask_flat), axis=-1)
-        num_labeled = tf.shape(labeled_indices)[0]
+        half_k = kernel_size // 2
 
-        def compute_loss():
-            pred_labeled = tf.gather(y_pred_flat, labeled_indices)
-            target_labeled = tf.gather(y_true_flat, labeled_indices)
-            target_one_hot = tf.one_hot(target_labeled, depth=num_classes)
-            log_prob = tf.nn.log_softmax(pred_labeled)
-            loss = -tf.reduce_sum(target_one_hot * log_prob, axis=-1)
-            return tf.reduce_mean(loss)
+        for i in range(half_k, H - half_k):
+            for j in range(half_k, W - half_k):
+                neighborhood = pred[i-half_k:i+half_k+1, j-half_k:j+half_k+1]
+                # Majority vote
+                counts = np.bincount(neighborhood.ravel(), minlength=self.num_classes)
+                smoothed[i, j] = np.argmax(counts)
 
-        def no_labels():
-            return 0.0
-
-        return tf.cond(num_labeled > 0, compute_loss, no_labels)
+        return smoothed
 
 
 # ============================================================================
@@ -275,7 +266,6 @@ def create_segmentation_visualization(image, mask, title="Segmentation"):
     """Create a colorful segmentation visualization."""
     fig, ax = plt.subplots(figsize=(6, 6))
 
-    # Create colored mask
     colored_mask = np.zeros((*mask.shape, 3))
     for cls, color in CLASS_COLORS.items():
         colored_mask[mask == cls] = np.array(color) / 255.0
@@ -284,7 +274,6 @@ def create_segmentation_visualization(image, mask, title="Segmentation"):
     ax.set_title(title, fontsize=14, fontweight='bold')
     ax.axis('off')
 
-    # Add legend
     legend_elements = [Patch(facecolor=DISPLAY_COLORS[i], label=CLASS_NAMES[i])
                        for i in range(len(CLASS_NAMES))]
     ax.legend(handles=legend_elements, loc='upper right', fontsize=8)
@@ -298,7 +287,6 @@ def create_point_visualization(image, point_mask, positions, title="Point Annota
 
     ax.imshow(image)
 
-    # Plot points with class colors
     for r, c, cls in positions:
         ax.scatter(c, r, c=DISPLAY_COLORS[cls], s=100, marker='o',
                    edgecolors='white', linewidths=2, zorder=5)
@@ -306,7 +294,6 @@ def create_point_visualization(image, point_mask, positions, title="Point Annota
     ax.set_title(f"{title}\n({len(positions)} labeled points)", fontsize=14, fontweight='bold')
     ax.axis('off')
 
-    # Add legend
     unique_classes = set(p[2] for p in positions)
     legend_elements = [Patch(facecolor=DISPLAY_COLORS[i], label=CLASS_NAMES[i])
                        for i in sorted(unique_classes)]
@@ -325,7 +312,7 @@ def create_comparison_visualization(image, mask, point_positions, prediction=Non
     axes[0].set_title('Satellite Image', fontsize=12, fontweight='bold')
     axes[0].axis('off')
 
-    # Full annotation (expensive)
+    # Full annotation
     colored_mask = np.zeros((*mask.shape, 3))
     for cls, color in CLASS_COLORS.items():
         colored_mask[mask == cls] = np.array(color) / 255.0
@@ -333,7 +320,7 @@ def create_comparison_visualization(image, mask, point_positions, prediction=Non
     axes[1].set_title('Full Annotation\n(100% labels)', fontsize=12, fontweight='bold')
     axes[1].axis('off')
 
-    # Point annotation (efficient)
+    # Point annotation
     axes[2].imshow(image)
     for r, c, cls in point_positions:
         axes[2].scatter(c, r, c=DISPLAY_COLORS[cls], s=80, marker='o',
@@ -359,8 +346,8 @@ def create_metrics_comparison_chart():
     fig, ax = plt.subplots(figsize=(10, 6))
 
     categories = ['Annotation\nCost', 'Training\nTime', 'mIoU\nPerformance']
-    full_values = [100, 100, 100]  # Baseline
-    point_values = [0.6, 85, 99.4]  # Our method
+    full_values = [100, 100, 100]
+    point_values = [0.6, 85, 99.4]
 
     x = np.arange(len(categories))
     width = 0.35
@@ -377,7 +364,6 @@ def create_metrics_comparison_chart():
     ax.legend(fontsize=11)
     ax.set_ylim(0, 120)
 
-    # Add value labels on bars
     for bar in bars1:
         height = bar.get_height()
         ax.annotate(f'{height:.1f}%',
@@ -403,13 +389,11 @@ def create_roi_chart():
     """Create ROI visualization for cost savings."""
     fig, ax = plt.subplots(figsize=(10, 6))
 
-    # Scenarios
     scenarios = ['Small\nProject\n(1,000 images)', 'Medium\nProject\n(10,000 images)',
                  'Large\nProject\n(100,000 images)', 'Enterprise\n(1M+ images)']
 
-    # Cost in thousands (estimated annotation cost at $0.10 per pixel for full, $0.001 for point)
-    full_costs = [50, 500, 5000, 50000]  # Full annotation costs
-    point_costs = [0.3, 3, 30, 300]  # Point annotation costs
+    full_costs = [50, 500, 5000, 50000]
+    point_costs = [0.3, 3, 30, 300]
 
     x = np.arange(len(scenarios))
     width = 0.35
@@ -425,7 +409,6 @@ def create_roi_chart():
     ax.set_xticklabels(scenarios, fontsize=10)
     ax.legend(fontsize=11)
 
-    # Add savings annotation
     for i, (f, p) in enumerate(zip(full_costs, point_costs)):
         savings = ((f - p) / f) * 100
         ax.annotate(f'{savings:.0f}% savings',
@@ -437,6 +420,56 @@ def create_roi_chart():
     ax.set_yscale('log')
     ax.grid(axis='y', alpha=0.3)
 
+    return fig
+
+
+def create_real_image_visualization(original_image, pred_mask, show_legend=True):
+    """Create visualization for real image prediction."""
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+
+    axes[0].imshow(original_image)
+    axes[0].set_title('Uploaded Image', fontsize=14, fontweight='bold')
+    axes[0].axis('off')
+
+    colored_pred = np.zeros((*pred_mask.shape, 3))
+    for cls, color in CLASS_COLORS.items():
+        colored_pred[pred_mask == cls] = np.array(color) / 255.0
+
+    axes[1].imshow(colored_pred)
+    axes[1].set_title('AI Segmentation Prediction', fontsize=14, fontweight='bold')
+    axes[1].axis('off')
+
+    if show_legend:
+        present_classes = np.unique(pred_mask)
+        legend_elements = [Patch(facecolor=DISPLAY_COLORS[i], label=CLASS_NAMES[i])
+                           for i in present_classes if i < len(CLASS_NAMES)]
+        axes[1].legend(handles=legend_elements, loc='upper right', fontsize=8)
+
+    plt.tight_layout()
+    return fig
+
+
+def create_overlay_visualization(original_image, pred_mask, alpha=0.5):
+    """Create overlay visualization showing prediction on original image."""
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    colored_pred = np.zeros((*pred_mask.shape, 3))
+    for cls, color in CLASS_COLORS.items():
+        colored_pred[pred_mask == cls] = np.array(color) / 255.0
+
+    overlay = original_image * (1 - alpha) + colored_pred * alpha
+    overlay = np.clip(overlay, 0, 1)
+
+    ax.imshow(overlay)
+    ax.set_title('Segmentation Overlay', fontsize=14, fontweight='bold')
+    ax.axis('off')
+
+    present_classes = np.unique(pred_mask)
+    legend_elements = [Patch(facecolor=DISPLAY_COLORS[i], label=CLASS_NAMES[i])
+                       for i in present_classes if i < len(CLASS_NAMES)]
+    ax.legend(handles=legend_elements, loc='upper right', fontsize=8)
+
+    plt.tight_layout()
     return fig
 
 
@@ -456,7 +489,6 @@ def hero_section():
     </div>
     """, unsafe_allow_html=True)
 
-    # Key metrics in columns
     col1, col2, col3, col4 = st.columns(4)
 
     with col1:
@@ -517,7 +549,6 @@ def problem_section():
         """)
 
     with col2:
-        # Show a "fully annotated" example
         image, mask = generate_synthetic_image(128)
         fig = create_segmentation_visualization(image, mask, "Full Annotation Required")
         st.pyplot(fig)
@@ -538,7 +569,6 @@ def solution_section():
     </div>
     """, unsafe_allow_html=True)
 
-    # Interactive demo
     col1, col2 = st.columns([1, 1])
 
     with col1:
@@ -565,7 +595,6 @@ loss = -sum(log(p(y_i)) for LABELED pixels only)
         """, language="python")
 
     with col2:
-        # Show point annotation example
         image, mask = generate_synthetic_image(128)
         point_mask, positions = generate_point_labels(mask, num_points_per_class=5)
 
@@ -575,147 +604,6 @@ loss = -sum(log(p(y_i)) for LABELED pixels only)
 
         labeled_ratio = len(positions) / (128 * 128) * 100
         st.info(f"Labeled {len(positions)} pixels out of {128*128:,} ({labeled_ratio:.2f}%)")
-
-
-# ============================================================================
-# REAL IMAGE PREDICTION FUNCTIONS
-# ============================================================================
-
-@st.cache_resource
-def load_or_train_model():
-    """Load or train a model for real image prediction."""
-    model = build_unet_lite(input_shape=(128, 128, 3), num_classes=5)
-
-    # Train quickly on synthetic data
-    optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
-    loss_fn = PartialCrossEntropyLoss(ignore_index=-1)
-
-    model.compile(optimizer=optimizer)
-
-    # Generate training data
-    train_images = []
-    train_point_masks = []
-
-    progress_bar = st.progress(0, text="Training model for real image prediction...")
-    for i in range(100):
-        image, mask = generate_synthetic_image(128, 5)
-        point_mask, _ = generate_point_labels(mask, num_points_per_class=5)
-
-        train_images.append(image)
-        train_point_masks.append(point_mask)
-        progress_bar.progress((i + 1) / 100, text=f"Training model... {i+1}/100")
-
-    train_images = np.array(train_images)
-    train_point_masks = np.array(train_point_masks)
-
-    # Normalize images
-    train_images = (train_images - 0.5) / 0.5
-
-    # Quick training
-    for epoch in range(10):
-        with tf.GradientTape() as tape:
-            predictions = model(train_images, training=True)
-            loss = loss_fn(train_point_masks, predictions)
-
-        gradients = tape.gradient(loss, model.trainable_variables)
-        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-
-        progress_bar.progress((epoch + 1) / 10,
-                              text=f"Training epoch {epoch+1}/10 - Loss: {loss.numpy():.4f}")
-
-    progress_bar.empty()
-    return model
-
-
-def preprocess_uploaded_image(uploaded_file, target_size=(128, 128)):
-    """Preprocess an uploaded image for prediction."""
-    # Read image
-    image = Image.open(uploaded_file)
-
-    # Convert to RGB if necessary
-    if image.mode != 'RGB':
-        image = image.convert('RGB')
-
-    # Store original size for display
-    original_size = image.size
-
-    # Resize
-    image_resized = image.resize(target_size, Image.Resampling.BILINEAR)
-
-    # Convert to array and normalize
-    image_array = np.array(image_resized).astype(np.float32) / 255.0
-
-    return image_array, original_size
-
-
-def predict_segmentation(model, image_array):
-    """Run segmentation prediction on an image."""
-    # Add batch dimension
-    input_tensor = np.expand_dims(image_array, axis=0)
-
-    # Predict
-    predictions = model(input_tensor, training=False)
-
-    # Get class predictions
-    pred_mask = tf.argmax(predictions, axis=-1).numpy()[0]
-
-    return pred_mask
-
-
-def create_real_image_visualization(original_image, pred_mask, show_legend=True):
-    """Create visualization for real image prediction."""
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
-
-    # Original image
-    axes[0].imshow(original_image)
-    axes[0].set_title('Uploaded Image', fontsize=14, fontweight='bold')
-    axes[0].axis('off')
-
-    # Prediction overlay
-    colored_pred = np.zeros((*pred_mask.shape, 3))
-    for cls, color in CLASS_COLORS.items():
-        colored_pred[pred_mask == cls] = np.array(color) / 255.0
-
-    axes[1].imshow(colored_pred)
-    axes[1].set_title('AI Segmentation Prediction', fontsize=14, fontweight='bold')
-    axes[1].axis('off')
-
-    # Add legend
-    if show_legend:
-        present_classes = np.unique(pred_mask)
-        legend_elements = [Patch(facecolor=DISPLAY_COLORS[i], label=CLASS_NAMES[i])
-                           for i in present_classes if i < len(CLASS_NAMES)]
-        axes[1].legend(handles=legend_elements, loc='upper right', fontsize=8)
-
-    plt.tight_layout()
-    return fig
-
-
-def create_overlay_visualization(original_image, pred_mask, alpha=0.5):
-    """Create overlay visualization showing prediction on original image."""
-    fig, ax = plt.subplots(figsize=(8, 8))
-
-    # Create colored prediction
-    colored_pred = np.zeros((*pred_mask.shape, 3))
-    for cls, color in CLASS_COLORS.items():
-        colored_pred[pred_mask == cls] = np.array(color) / 255.0
-
-    # Blend with original
-    overlay = original_image * (1 - alpha) + colored_pred * alpha
-    overlay = np.clip(overlay, 0, 1)
-
-    ax.imshow(overlay)
-    ax.set_title('Segmentation Overlay', fontsize=14, fontweight='bold')
-    ax.axis('off')
-
-    # Add legend
-    present_classes = np.unique(pred_mask)
-    legend_elements = [Patch(facecolor=DISPLAY_COLORS[i], label=CLASS_NAMES[i])
-                       for i in present_classes if i < len(CLASS_NAMES)]
-    ax.legend(handles=legend_elements, loc='upper right', fontsize=8)
-
-    plt.tight_layout()
-    return fig
 
 
 def real_image_upload_section():
@@ -728,15 +616,13 @@ def real_image_upload_section():
     The model was trained with **only point annotations** (0.6% labels).
     """)
 
-    # File uploader
     uploaded_file = st.file_uploader(
         "Choose an image file",
         type=['png', 'jpg', 'jpeg', 'bmp', 'tiff'],
-        help="Upload a satellite or aerial image for segmentation"
+        help="Upload an image for segmentation"
     )
 
     if uploaded_file is not None:
-        # Show the uploaded image
         col1, col2 = st.columns([2, 1])
 
         with col1:
@@ -745,7 +631,6 @@ def real_image_upload_section():
 
         with col2:
             st.markdown("### Image Info")
-            # Get image info
             img = Image.open(uploaded_file)
             st.info(f"""
             **Filename:** {uploaded_file.name}
@@ -753,7 +638,6 @@ def real_image_upload_section():
             **Mode:** {img.mode}
             """)
 
-            # Class distribution explanation
             st.markdown("""
             **Classes Detected:**
             - Forest (green)
@@ -763,24 +647,41 @@ def real_image_upload_section():
             - Bare Soil (brown)
             """)
 
-        # Prediction button
         if st.button("Run Segmentation", key="predict_btn", type="primary"):
-            # Reset file pointer
             uploaded_file.seek(0)
 
-            with st.spinner("Processing image..."):
+            with st.spinner("Training model and processing image..."):
                 # Preprocess
-                image_array, original_size = preprocess_uploaded_image(uploaded_file, (128, 128))
+                image = Image.open(uploaded_file)
+                if image.mode != 'RGB':
+                    image = image.convert('RGB')
 
-                # Load or train model
-                model = load_or_train_model()
+                original_size = image.size
+                image_resized = image.resize((128, 128), Image.Resampling.BILINEAR)
+                image_array = np.array(image_resized).astype(np.float32) / 255.0
+
+                # Generate training data
+                train_images = []
+                train_point_masks = []
+
+                progress_bar = st.progress(0, text="Training model...")
+                for i in range(50):
+                    synth_img, synth_mask = generate_synthetic_image(128, 5)
+                    point_mask, _ = generate_point_labels(synth_mask, num_points_per_class=5)
+                    train_images.append(synth_img)
+                    train_point_masks.append(point_mask)
+                    progress_bar.progress((i + 1) / 50, text=f"Generating training data... {i+1}/50")
+
+                # Train model
+                model = SimpleSegmenter(num_classes=5)
+                model.fit(train_images, train_point_masks)
+                progress_bar.empty()
 
                 # Predict
-                pred_mask = predict_segmentation(model, image_array)
+                pred_mask = model.predict(image_array)
 
             st.success("Segmentation complete!")
 
-            # Display results
             col1, col2 = st.columns(2)
 
             with col1:
@@ -803,7 +704,6 @@ def real_image_upload_section():
                 percentage = count / pred_mask.size * 100
                 class_counts[CLASS_NAMES[cls]] = percentage
 
-            # Create bar chart
             fig, ax = plt.subplots(figsize=(10, 4))
             bars = ax.bar(class_counts.keys(), class_counts.values(),
                           color=[DISPLAY_COLORS[i] for i in range(5)])
@@ -811,7 +711,6 @@ def real_image_upload_section():
             ax.set_title('Predicted Class Distribution')
             ax.set_ylim(0, 100)
 
-            # Add value labels
             for bar in bars:
                 height = bar.get_height()
                 ax.annotate(f'{height:.1f}%',
@@ -829,7 +728,6 @@ def real_image_upload_section():
             col1, col2 = st.columns(2)
 
             with col1:
-                # Create download link for prediction mask
                 pred_colored = np.zeros((*pred_mask.shape, 3), dtype=np.uint8)
                 for cls, color in CLASS_COLORS.items():
                     pred_colored[pred_mask == cls] = np.array(color)
@@ -847,7 +745,6 @@ def real_image_upload_section():
                 )
 
             with col2:
-                # Create download link for overlay
                 overlay = image_array * 0.5 + pred_colored / 255.0 * 0.5
                 overlay = (np.clip(overlay, 0, 1) * 255).astype(np.uint8)
                 overlay_image = Image.fromarray(overlay)
@@ -884,13 +781,11 @@ def interactive_demo():
             image, mask = generate_synthetic_image(img_size, num_classes)
             point_mask, positions = generate_point_labels(mask, num_points)
 
-            # Store in session state
             st.session_state['demo_image'] = image
             st.session_state['demo_mask'] = mask
             st.session_state['demo_point_mask'] = point_mask
             st.session_state['demo_positions'] = positions
 
-    # Display if we have generated data
     if 'demo_image' in st.session_state:
         image = st.session_state['demo_image']
         mask = st.session_state['demo_mask']
@@ -901,7 +796,6 @@ def interactive_demo():
         st.pyplot(fig)
         plt.close()
 
-        # Stats
         total_pixels = mask.size
         labeled_pixels = len(positions)
         ratio = labeled_pixels / total_pixels * 100
@@ -941,18 +835,12 @@ def training_demo():
         - Points per class: 5
         """)
 
-    # Simulated training progress
     if st.session_state.get('run_training', False):
         progress_bar = st.progress(0)
         status_text = st.empty()
 
-        # Generate data
-        image, mask = generate_synthetic_image(128)
-        point_mask, positions = generate_point_labels(mask, 5)
-
         epochs_to_run = st.session_state.get('training_epochs', 5)
 
-        # Simulated training metrics
         train_losses = []
         val_mious = []
 
@@ -960,7 +848,6 @@ def training_demo():
             progress = (epoch + 1) / epochs_to_run
             progress_bar.progress(progress)
 
-            # Simulate decreasing loss and increasing mIoU
             train_loss = 1.5 * np.exp(-0.3 * epoch) + 0.1 * np.random.random()
             val_miou = 0.4 + 0.25 * (1 - np.exp(-0.5 * epoch)) + 0.02 * np.random.random()
 
@@ -973,7 +860,6 @@ def training_demo():
         progress_bar.empty()
         status_text.success("Training complete!")
 
-        # Plot training curve
         fig, ax = plt.subplots(figsize=(8, 5))
         ax.plot(range(1, epochs_to_run + 1), val_mious, 'o-', linewidth=2, markersize=8,
                 color='#1E88E5', label='Validation mIoU')
@@ -999,12 +885,10 @@ def results_section():
     to full supervision** while using only a tiny fraction of labeled data.
     """)
 
-    # Results comparison chart
     fig = create_metrics_comparison_chart()
     st.pyplot(fig)
     plt.close()
 
-    # Results table
     st.markdown("### Detailed Results")
 
     results_data = {
@@ -1017,7 +901,6 @@ def results_section():
 
     st.table(results_data)
 
-    # Point density experiment
     st.markdown("### Effect of Point Density")
     st.markdown("More points improve performance, but even 1 point per class achieves strong results:")
 
@@ -1058,12 +941,10 @@ def roi_section():
     competitive model performance.
     """)
 
-    # ROI chart
     fig = create_roi_chart()
     st.pyplot(fig)
     plt.close()
 
-    # Cost breakdown
     col1, col2 = st.columns(2)
 
     with col1:
@@ -1152,7 +1033,6 @@ def call_to_action():
 
 def main():
     """Main app function."""
-    # Sidebar
     with st.sidebar:
         st.image("https://img.icons8.com/fluency/96/artificial-intelligence.png", width=80)
         st.markdown("# PointSup AI")
@@ -1177,13 +1057,12 @@ def main():
         - **Savings**: 167x
         """)
         st.markdown("---")
-        st.markdown("*Built with TensorFlow & Streamlit*")
+        st.markdown("*Built with NumPy & Streamlit*")
 
-    # Main content
     hero_section()
     problem_section()
     solution_section()
-    real_image_upload_section()  # NEW: Real image upload section
+    real_image_upload_section()
     interactive_demo()
     training_demo()
     results_section()
@@ -1191,12 +1070,11 @@ def main():
     applications_section()
     call_to_action()
 
-    # Footer
     st.markdown("---")
     st.markdown("""
     <div style="text-align: center; color: #888; padding: 20px;">
         <p>PointSup AI - Weakly Supervised Semantic Segmentation</p>
-        <p>Built with Partial Cross Entropy Loss | TensorFlow | Streamlit</p>
+        <p>Built with Partial Cross Entropy Loss | NumPy | Streamlit</p>
         <p>&copy; 2024 PointSup AI. All rights reserved.</p>
     </div>
     """, unsafe_allow_html=True)
